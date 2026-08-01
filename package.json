@@ -1,0 +1,8 @@
+{
+  "name": "index-notify-server",
+  "version": "1.0.0",
+  "dependencies": {
+    "web-push": "^3.6.7",
+    "@netlify/blobs": "^7.0.0"
+  }
+}
