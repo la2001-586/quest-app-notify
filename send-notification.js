@@ -5,7 +5,11 @@ const { getStore } = require('@netlify/blobs');
 
 exports.handler = async (event) => {
   try {
-    const store = getStore('push-subscriptions');
+    const store = getStore({
+      name: 'push-subscriptions',
+      siteID: process.env.NETLIFY_BLOBS_SITE_ID,
+      token: process.env.NETLIFY_BLOBS_TOKEN,
+    });
     const raw = await store.get('main');
     if (!raw) {
       return { statusCode: 404, body: '宛先がまだ登録されていません。先にアプリで通知を許可してください。' };
