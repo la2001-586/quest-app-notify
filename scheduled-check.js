@@ -1,11 +1,12 @@
 // 15分ごとに自動実行され、「今送るべき通知が無いか」を全員分チェックして送る関数
-// v2: 通知の種類ごとのON/OFF設定、スヌーズ、やり忘れ再通知に対応
+// v3: Netlifyのログ機能が不調なため、レスポンス自体に詳しい状況を返すデバッグ版
 const webpush = require('web-push');
 const { getStore } = require('@netlify/blobs');
 
 const ABSENCE_MILESTONES_DAYS = [1, 5, 30, 60, 90, 365];
 
 exports.handler = async () => {
+  const debug = { subscribers: 0, details: [] };
   try {
     const store = getStore({
       name: 'push-subscriptions',
@@ -19,7 +20,10 @@ exports.handler = async () => {
     );
 
     const { blobs } = await store.list({ prefix: 'sub_' });
-    if (!blobs) return { statusCode: 200, body: 'no subscribers' };
+    if (!blobs || blobs.length === 0) {
+      return { statusCode: 200, body: JSON.stringify({ result: 'no subscribers found', debug }) };
+    }
+    debug.subscribers = blobs.length;
 
     const now = new Date();
     const jstHour = (now.getUTCHours() + 9) % 24;
@@ -27,38 +31,49 @@ exports.handler = async () => {
 
     for (const b of blobs) {
       const key = b.key.replace('sub_', '');
+      const entry = { key, sent: 0, errors: [] };
       let subscription;
       try {
         subscription = JSON.parse(await store.get(b.key));
-      } catch (e) { continue; }
+      } catch (e) {
+        entry.errors.push('subscription parse failed: ' + e.message);
+        debug.details.push(entry);
+        continue;
+      }
 
-      // この人が、どの種類の通知を有効にしているか(設定が無ければ全部有効扱い)
       let prefs = { reminder: true, morning: true, absence: true, overdue: true };
       try {
         const prefsRaw = await store.get(`prefs_${key}`);
         if (prefsRaw) prefs = JSON.parse(prefsRaw);
       } catch (e) {}
+      entry.prefs = prefs;
 
       async function send(title, body, extra) {
         try {
           await webpush.sendNotification(subscription, JSON.stringify({ title, body, ...extra }));
+          entry.sent++;
         } catch (e) {
+          entry.errors.push(`send failed (${e.statusCode || '?'}): ${e.message}`);
           if (e.statusCode === 404 || e.statusCode === 410) await store.delete(b.key);
         }
       }
 
-      // ① 時間指定のリマインド + やり忘れ再通知
+      // 時間指定のリマインド + やり忘れ再通知
       if (prefs.reminder) {
         try {
           const raw = await store.get(`reminders_${key}`);
+          entry.remindersRaw = raw || '(none)';
           if (raw) {
             const reminders = JSON.parse(raw);
+            entry.remindersCount = reminders.length;
+            entry.nowISO = now.toISOString();
             const stillPending = [];
             const awaitingOverdueRaw = await store.get(`overdue_wait_${key}`).catch(() => null);
             let awaitingOverdue = awaitingOverdueRaw ? JSON.parse(awaitingOverdueRaw) : [];
 
             for (const r of reminders) {
-              if (new Date(r.fireAt).getTime() <= now.getTime()) {
+              const due = new Date(r.fireAt).getTime() <= now.getTime();
+              if (due) {
                 await send(r.title || 'index', r.body || '', { type: 'reminder', eventId: r.eventId, reminderPayload: r });
                 if (r.overdueEnabled && prefs.overdue && r.overdueCheckAt) {
                   awaitingOverdue.push({ eventId: r.eventId, text: r.body, checkAt: r.overdueCheckAt });
@@ -71,7 +86,6 @@ exports.handler = async () => {
               await store.set(`reminders_${key}`, JSON.stringify(stillPending));
             }
 
-            // やり忘れ再通知: 時間が来たものを送る(完了済みかはサーバー側からは分からないため、あくまで軽い確認の通知として送る)
             const stillAwaiting = [];
             for (const item of awaitingOverdue) {
               if (new Date(item.checkAt).getTime() <= now.getTime()) {
@@ -82,10 +96,12 @@ exports.handler = async () => {
             }
             await store.set(`overdue_wait_${key}`, JSON.stringify(stillAwaiting));
           }
-        } catch (e) {}
+        } catch (e) {
+          entry.errors.push('reminder block failed: ' + e.message);
+        }
       }
 
-      // ② 朝の挨拶(JST 6時台に、その日まだ送っていなければ1回だけ)
+      // 朝の挨拶
       if (prefs.morning) {
         try {
           if (jstHour === 6) {
@@ -96,10 +112,12 @@ exports.handler = async () => {
               await store.set(`morning_${key}`, JSON.stringify({ lastSentDate: todayKeyJST }));
             }
           }
-        } catch (e) {}
+        } catch (e) {
+          entry.errors.push('morning block failed: ' + e.message);
+        }
       }
 
-      // ③ 休眠復帰通知
+      // 休眠復帰通知
       if (prefs.absence) {
         try {
           const lastSeenRaw = await store.get(`lastseen_${key}`).catch(() => null);
@@ -116,13 +134,17 @@ exports.handler = async () => {
             }
             await store.set(`absence_milestone_${key}`, JSON.stringify(notifiedMilestones));
           }
-        } catch (e) {}
+        } catch (e) {
+          entry.errors.push('absence block failed: ' + e.message);
+        }
       }
+
+      debug.details.push(entry);
     }
 
-    return { statusCode: 200, body: 'checked' };
+    return { statusCode: 200, body: JSON.stringify({ result: 'checked', debug }, null, 2) };
   } catch (err) {
-    return { statusCode: 500, body: 'エラー: ' + err.message };
+    return { statusCode: 500, body: JSON.stringify({ result: 'top-level error', message: err.message, debug }) };
   }
 };
 
